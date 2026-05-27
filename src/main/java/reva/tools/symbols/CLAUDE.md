@@ -9,8 +9,17 @@ The symbols tools package (`reva.tools.symbols`) provides MCP tools for interact
 ## Key Tools
 
 ### Symbol Retrieval Tools
-- `get-symbols` - Retrieve symbols from a program with pagination support
-- `get-symbols-count` - Get total count of symbols (use before pagination)
+- `get-symbols` - Retrieve symbols from a program with pagination, regex name filtering, and symbol type filtering
+- `get-symbols-count` - Get total count of symbols with optional regex name filtering (use before pagination)
+
+### Filtering Parameters
+Both tools support:
+- `namePattern` (string) - Regex to filter symbols by name (e.g. `(?i)parse.*string`). Uses `Pattern.find()` so partial matches work.
+- `filterDefaultNames` (boolean, default true) - Filter out FUN_, DAT_, etc.
+- `includeExternal` (boolean, default false) - Include external symbols
+
+`get-symbols` additionally supports:
+- `symbolTypes` (array of strings) - Filter by symbol type (e.g. `["Function", "Label", "Class"]`). Case-insensitive comparison against `SymbolType.toString()`.
 
 ## Symbol Table Operations
 
@@ -211,7 +220,8 @@ while (current != null && !current.isGlobal()) {
 {
   "count": 1250,
   "includeExternal": false,
-  "filterDefaultNames": true
+  "filterDefaultNames": true,
+  "namePattern": "(?i)parse.*string"
 }
 ```
 

@@ -83,6 +83,188 @@ public class DecompilerToolProvider extends AbstractToolProvider {
     // Track which functions have been read by the LLM to enforce read-before-modify pattern
     private final Map<String, Long> readDecompilationTracker = new ConcurrentHashMap<>();
 
+    // ============================================================================
+    // Decompilation Cache — avoids redundant decompilation of the same function.
+    // Keyed by "programPath:address". Stores the decompiled C text and signature.
+    // Invalidated on program close and after modification tools (rename, retype).
+    // ============================================================================
+
+    /** Cached decompilation result for a single function. */
+    private static class CachedDecompilation {
+        final String cCode;
+        final String signature;
+        final long timestamp;
+
+        CachedDecompilation(String cCode, String signature) {
+            this.cCode = cCode;
+            this.signature = signature;
+            this.timestamp = System.currentTimeMillis();
+        }
+
+        CachedDecompilation(String cCode, String signature, long timestamp) {
+            this.cCode = cCode;
+            this.signature = signature;
+            this.timestamp = timestamp;
+        }
+    }
+
+    /** Cache of decompiled C text keyed by "programPath:address". */
+    private final Map<String, CachedDecompilation> decompilationCache = new ConcurrentHashMap<>();
+
+    /** Addresses that timed out during decompilation — skip on retry. */
+    private final Map<String, Long> timeoutBlacklist = new ConcurrentHashMap<>();
+
+    /** How long a timeout blacklist entry stays valid (10 minutes). */
+    private static final long TIMEOUT_BLACKLIST_EXPIRY_MS = TimeUnit.MINUTES.toMillis(10);
+
+    /** Programs whose persistent cache has been loaded into memory. */
+    private final Set<String> persistentCacheLoaded = ConcurrentHashMap.newKeySet();
+
+    /** Whether the persistent cache has pending writes that need flushing. */
+    private final Set<String> persistentCacheDirty = ConcurrentHashMap.newKeySet();
+
+    /** Directory for persistent decompilation cache files. */
+    private static final String CACHE_DIR_NAME = ".reva";
+    private static final String CACHE_SUBDIR = "decomp-cache";
+
+    private java.io.File getPersistentCacheFile(String programPath) {
+        // Sanitize programPath to a safe filename
+        String safeName = programPath.replaceAll("[^a-zA-Z0-9._-]", "_");
+        java.io.File cacheDir = new java.io.File(
+            System.getProperty("user.home"), CACHE_DIR_NAME + "/" + CACHE_SUBDIR);
+        cacheDir.mkdirs();
+        return new java.io.File(cacheDir, safeName + ".json");
+    }
+
+    /**
+     * Load persistent cache for a program from disk (once per session).
+     */
+    @SuppressWarnings("unchecked")
+    private void ensurePersistentCacheLoaded(Program program) {
+        String programPath = program.getDomainFile().getPathname();
+        if (persistentCacheLoaded.contains(programPath)) {
+            return;
+        }
+        persistentCacheLoaded.add(programPath);
+
+        java.io.File cacheFile = getPersistentCacheFile(programPath);
+        if (!cacheFile.exists()) {
+            logInfo("No persistent decompilation cache for: " + programPath);
+            return;
+        }
+
+        try {
+            Map<String, Object> data = JSON.readValue(cacheFile, Map.class);
+            int loaded = 0;
+            Map<String, Object> entries = (Map<String, Object>) data.get("entries");
+            if (entries != null) {
+                for (Map.Entry<String, Object> entry : entries.entrySet()) {
+                    String cacheKey = programPath + ":" + entry.getKey();
+                    // Don't overwrite in-memory entries (they're more recent)
+                    if (!decompilationCache.containsKey(cacheKey)) {
+                        Map<String, Object> val = (Map<String, Object>) entry.getValue();
+                        String cCode = (String) val.get("cCode");
+                        String signature = (String) val.get("signature");
+                        long timestamp = val.containsKey("timestamp") ?
+                            ((Number) val.get("timestamp")).longValue() : 0;
+                        if (cCode != null) {
+                            decompilationCache.put(cacheKey, new CachedDecompilation(cCode, signature, timestamp));
+                            loaded++;
+                        }
+                    }
+                }
+            }
+            if (loaded > 0) {
+                logInfo("Loaded " + loaded + " cached decompilations from disk for: " + programPath);
+            }
+        } catch (Exception e) {
+            logError("Failed to load persistent decompilation cache for: " + programPath, e);
+        }
+    }
+
+    /**
+     * Save dirty cache entries for a program to disk.
+     */
+    private void savePersistentCache(String programPath) {
+        if (!persistentCacheDirty.remove(programPath)) {
+            return; // Nothing to save
+        }
+
+        // Collect all entries for this program
+        Map<String, Object> entries = new HashMap<>();
+        String prefix = programPath + ":";
+        for (Map.Entry<String, CachedDecompilation> entry : decompilationCache.entrySet()) {
+            if (entry.getKey().startsWith(prefix)) {
+                String address = entry.getKey().substring(prefix.length());
+                CachedDecompilation cached = entry.getValue();
+                Map<String, Object> val = new HashMap<>();
+                val.put("cCode", cached.cCode);
+                val.put("signature", cached.signature);
+                val.put("timestamp", cached.timestamp);
+                entries.put(address, val);
+            }
+        }
+
+        if (entries.isEmpty()) {
+            return;
+        }
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("programPath", programPath);
+        data.put("savedAt", System.currentTimeMillis());
+        data.put("entryCount", entries.size());
+        data.put("entries", entries);
+
+        try {
+            java.io.File cacheFile = getPersistentCacheFile(programPath);
+            JSON.writeValue(cacheFile, data);
+            logInfo("Saved " + entries.size() + " cached decompilations to disk for: " + programPath);
+        } catch (Exception e) {
+            logError("Failed to save persistent decompilation cache for: " + programPath, e);
+        }
+    }
+
+    private String makeCacheKey(Program program, Address address) {
+        return program.getDomainFile().getPathname() + ":" + AddressUtil.formatAddress(address);
+    }
+
+    /** Get from cache, loading persistent cache first if needed. */
+    private CachedDecompilation cacheGet(Program program, String cacheKey) {
+        ensurePersistentCacheLoaded(program);
+        return decompilationCache.get(cacheKey);
+    }
+
+    /** Put into cache and mark for persistence. */
+    private void cachePut(Program program, String cacheKey, CachedDecompilation value) {
+        decompilationCache.put(cacheKey, value);
+        persistentCacheDirty.add(program.getDomainFile().getPathname());
+    }
+
+    private void invalidateCacheForProgram(String programPath) {
+        int beforeSize = decompilationCache.size();
+        decompilationCache.entrySet().removeIf(e -> e.getKey().startsWith(programPath + ":"));
+        timeoutBlacklist.entrySet().removeIf(e -> e.getKey().startsWith(programPath + ":"));
+        int removed = beforeSize - decompilationCache.size();
+        if (removed > 0) {
+            logInfo("DecompilerToolProvider: Evicted " + removed + " cached decompilations for: " + programPath);
+        }
+        // Also delete persistent cache file
+        java.io.File cacheFile = getPersistentCacheFile(programPath);
+        if (cacheFile.exists()) {
+            cacheFile.delete();
+            logInfo("Deleted persistent cache file for: " + programPath);
+        }
+        persistentCacheLoaded.remove(programPath);
+        persistentCacheDirty.remove(programPath);
+    }
+
+    private void invalidateCacheEntry(Program program, Function function) {
+        String key = makeCacheKey(program, function.getEntryPoint());
+        decompilationCache.remove(key);
+        // Mark dirty so the persistent file gets updated on close
+        persistentCacheDirty.add(program.getDomainFile().getPathname());
+    }
+
     /**
      * Constructor
      * @param server The MCP server
@@ -109,11 +291,29 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             logInfo("DecompilerToolProvider: Cleared " + removed +
                 " read tracking entries for closed program: " + programPath);
         }
+
+        // Save cache to disk before clearing memory
+        savePersistentCache(programPath);
+
+        // Clear in-memory cache (will be reloaded from disk on next open)
+        decompilationCache.entrySet().removeIf(e -> e.getKey().startsWith(programPath + ":"));
+        timeoutBlacklist.entrySet().removeIf(e -> e.getKey().startsWith(programPath + ":"));
+        persistentCacheLoaded.remove(programPath);
+    }
+
+    @Override
+    public void cleanup() {
+        super.cleanup();
+        // Flush all dirty persistent caches on shutdown
+        for (String programPath : persistentCacheDirty) {
+            savePersistentCache(programPath);
+        }
     }
 
     @Override
     public void registerTools() {
         registerGetDecompilationTool();
+        registerGetFunctionOverviewTool();
         registerSearchDecompilationTool();
         registerRenameVariablesTool();
         registerChangeVariableDataTypesTool();
@@ -909,7 +1109,41 @@ public class DecompilerToolProvider extends AbstractToolProvider {
 
             // Get decompilation using helper methods
             final String toolName = "get-decompilation";
-            logInfo(toolName + ": Starting decompilation for function " + function.getName() +
+            String cacheKey = makeCacheKey(program, function.getEntryPoint());
+
+            // Check timeout blacklist — skip functions that previously timed out
+            Long blacklistTime = timeoutBlacklist.get(cacheKey);
+            if (blacklistTime != null && (System.currentTimeMillis() - blacklistTime) < TIMEOUT_BLACKLIST_EXPIRY_MS) {
+                return createErrorResult("Decompilation of '" + function.getName() +
+                    "' previously timed out. The blacklist expires in " +
+                    ((TIMEOUT_BLACKLIST_EXPIRY_MS - (System.currentTimeMillis() - blacklistTime)) / 1000) +
+                    " seconds. Use read-memory or search-listing to inspect this function instead.");
+            }
+
+            // Check cache for non-markup requests (common case)
+            boolean needsMarkup = includeDisassembly || includeComments;
+            CachedDecompilation cached = cacheGet(program, cacheKey);
+
+            if (cached != null && !needsMarkup) {
+                logInfo(toolName + ": Cache hit for " + function.getName());
+
+                // Build result from cache
+                Map<String, Object> syncedContent = getSynchronizedContent(program, null, cached.cCode,
+                    offset, limit, false, false, includeIncomingReferences, includeReferenceContext, function);
+                resultData.putAll(syncedContent);
+                resultData.put("decompSignature", cached.signature);
+                resultData.put("cacheHit", true);
+
+                // Track read
+                String programPath = getString(request, "programPath");
+                String functionKey = programPath + ":" + AddressUtil.formatAddress(function.getEntryPoint());
+                readDecompilationTracker.put(functionKey, System.currentTimeMillis());
+
+                return createJsonResult(resultData);
+            }
+
+            logInfo(toolName + ": " + (cached != null ? "Cache hit but markup needed" : "Cache miss") +
+                    " for " + function.getName() +
                     " at " + AddressUtil.formatAddress(function.getEntryPoint()) + " in " + program.getName());
 
             DecompInterface decompiler = createConfiguredDecompiler(program, toolName);
@@ -922,15 +1156,24 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             try {
                 DecompilationAttempt attempt = decompileFunctionSafely(decompiler, function, toolName);
                 if (!attempt.success()) {
+                    // Track timeout in blacklist
+                    if (attempt.errorMessage() != null && attempt.errorMessage().contains("timed out")) {
+                        timeoutBlacklist.put(cacheKey, System.currentTimeMillis());
+                    }
                     return createErrorResult(attempt.errorMessage());
                 }
 
                 // Get the decompiled code and markup
                 DecompiledFunction decompiledFunction = attempt.results().getDecompiledFunction();
                 ClangTokenGroup markup = attempt.results().getCCodeMarkup();
+                String cCode = decompiledFunction.getC();
+                String signature = decompiledFunction.getSignature();
+
+                // Cache the decompilation
+                cachePut(program, cacheKey, new CachedDecompilation(cCode, signature));
 
                 // Get synchronized decompilation with optional assembly listing and comments
-                Map<String, Object> syncedContent = getSynchronizedContent(program, markup, decompiledFunction.getC(),
+                Map<String, Object> syncedContent = getSynchronizedContent(program, markup, cCode,
                     offset, limit, includeDisassembly, includeComments, includeIncomingReferences, includeReferenceContext, function);
 
                 // Add content to results
@@ -948,7 +1191,7 @@ public class DecompilerToolProvider extends AbstractToolProvider {
                 }
 
                 // Get additional details like high-level function signature
-                resultData.put("decompSignature", decompiledFunction.getSignature());
+                resultData.put("decompSignature", signature);
 
                 // Track that this function's decompilation has been read
                 String programPath = getString(request, "programPath");
@@ -964,6 +1207,190 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             } finally {
                 decompiler.dispose();
             }
+
+            return createJsonResult(resultData);
+        });
+    }
+
+    /**
+     * Register a compound tool that returns a full function overview in a single call:
+     * decompilation + callers + callees + referenced strings + xref count.
+     * Replaces the common 3-4 round trip pattern of get-decompilation → find-cross-references → get-decompilation × N.
+     */
+    private void registerGetFunctionOverviewTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("functionNameOrAddress", Map.of(
+            "type", "string",
+            "description", "Function name, address, or symbol to analyze (e.g. 'main', '0x00401000')"
+        ));
+
+        List<String> required = List.of("programPath", "functionNameOrAddress");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("get-function-overview")
+            .title("Get Function Overview")
+            .description("Get a comprehensive overview of a function in a single call: decompilation, " +
+                "callers with call-site context, callees, referenced strings, and cross-reference counts. " +
+                "Use this instead of multiple separate get-decompilation + find-cross-references calls.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            final String toolName = "get-function-overview";
+            Program program = getProgramFromArgs(request);
+            Function function = getFunctionFromArgs(request.arguments(), program);
+
+            followRead(program, function.getEntryPoint());
+
+            Map<String, Object> resultData = new HashMap<>();
+            resultData.put("programName", program.getName());
+            resultData.put("functionName", function.getName());
+            resultData.put("functionAddress", AddressUtil.formatAddress(function.getEntryPoint()));
+
+            // 1. Decompilation (from cache if available)
+            String cacheKey = makeCacheKey(program, function.getEntryPoint());
+            CachedDecompilation cached = cacheGet(program, cacheKey);
+            String cCode;
+            String signature;
+
+            if (cached != null) {
+                cCode = cached.cCode;
+                signature = cached.signature;
+                resultData.put("cacheHit", true);
+            } else {
+                DecompInterface decompiler = createConfiguredDecompiler(program, toolName);
+                if (decompiler == null) {
+                    resultData.put("decompilationError", "Failed to initialize decompiler");
+                    cCode = "";
+                    signature = "";
+                } else {
+                    try {
+                        DecompilationAttempt attempt = decompileFunctionSafely(decompiler, function, toolName);
+                        if (attempt.success()) {
+                            cCode = attempt.results().getDecompiledFunction().getC();
+                            signature = attempt.results().getDecompiledFunction().getSignature();
+                            cachePut(program, cacheKey, new CachedDecompilation(cCode, signature));
+                        } else {
+                            cCode = "";
+                            signature = "";
+                            resultData.put("decompilationError", attempt.errorMessage());
+                        }
+                    } finally {
+                        decompiler.dispose();
+                    }
+                }
+            }
+
+            // Format decompilation with line numbers
+            if (!cCode.isEmpty()) {
+                String[] lines = cCode.split("\n");
+                StringBuilder formatted = new StringBuilder();
+                for (int i = 0; i < lines.length; i++) {
+                    formatted.append(String.format("%4d\t%s\n", i + 1, lines[i]));
+                }
+                resultData.put("decompilation", formatted.toString());
+                resultData.put("totalLines", lines.length);
+            }
+            resultData.put("decompSignature", signature);
+
+            // Track read
+            String programPath = getString(request, "programPath");
+            String functionKey = programPath + ":" + AddressUtil.formatAddress(function.getEntryPoint());
+            readDecompilationTracker.put(functionKey, System.currentTimeMillis());
+
+            // 2. Callers — functions that call this one, with call-site snippet
+            ReferenceManager refManager = program.getReferenceManager();
+            FunctionManager funcManager = program.getFunctionManager();
+
+            List<Map<String, Object>> callers = new ArrayList<>();
+            Set<Address> seenCallerFunctions = new HashSet<>();
+            ReferenceIterator refsTo = refManager.getReferencesTo(function.getEntryPoint());
+            int totalCallRefs = 0;
+
+            while (refsTo.hasNext()) {
+                Reference ref = refsTo.next();
+                totalCallRefs++;
+                if (callers.size() >= 20) continue; // Count total but limit detail
+
+                Address fromAddr = ref.getFromAddress();
+                Function callerFunc = funcManager.getFunctionContaining(fromAddr);
+                if (callerFunc == null || !seenCallerFunctions.add(callerFunc.getEntryPoint())) {
+                    continue;
+                }
+
+                Map<String, Object> callerInfo = new HashMap<>();
+                callerInfo.put("name", callerFunc.getName());
+                callerInfo.put("address", AddressUtil.formatAddress(callerFunc.getEntryPoint()));
+                callerInfo.put("callSiteAddress", AddressUtil.formatAddress(fromAddr));
+
+                // Get call-site context from cached decompilation if available
+                String callerCacheKey = makeCacheKey(program, callerFunc.getEntryPoint());
+                CachedDecompilation callerCached = cacheGet(program, callerCacheKey);
+                if (callerCached != null) {
+                    // Find the line containing a call to our function
+                    String[] callerLines = callerCached.cCode.split("\n");
+                    String funcName = function.getName();
+                    for (int i = 0; i < callerLines.length; i++) {
+                        if (callerLines[i].contains(funcName)) {
+                            callerInfo.put("callSiteLine", i + 1);
+                            callerInfo.put("callSiteSnippet", callerLines[i].trim());
+                            break;
+                        }
+                    }
+                }
+
+                callers.add(callerInfo);
+            }
+
+            resultData.put("callers", callers);
+            resultData.put("totalCallerReferences", totalCallRefs);
+            resultData.put("uniqueCallerFunctions", callers.size());
+
+            // 3. Callees — functions called by this one
+            List<Map<String, Object>> callees = new ArrayList<>();
+            Set<Address> seenCallees = new HashSet<>();
+            AddressSetView body = function.getBody();
+            for (Address addr : body.getAddresses(true)) {
+                Reference[] refsFrom = refManager.getReferencesFrom(addr);
+                for (Reference ref : refsFrom) {
+                    if (!ref.getReferenceType().isCall()) continue;
+                    Address toAddr = ref.getToAddress();
+                    Function calleeFunc = funcManager.getFunctionAt(toAddr);
+                    if (calleeFunc == null || !seenCallees.add(calleeFunc.getEntryPoint())) {
+                        continue;
+                    }
+                    Map<String, Object> calleeInfo = new HashMap<>();
+                    calleeInfo.put("name", calleeFunc.getName());
+                    calleeInfo.put("address", AddressUtil.formatAddress(calleeFunc.getEntryPoint()));
+                    callees.add(calleeInfo);
+                }
+            }
+            resultData.put("callees", callees);
+
+            // 4. Referenced strings
+            List<Map<String, Object>> strings = new ArrayList<>();
+            for (Address addr : body.getAddresses(true)) {
+                Reference[] refsFrom = refManager.getReferencesFrom(addr);
+                for (Reference ref : refsFrom) {
+                    if (ref.getReferenceType().isCall()) continue;
+                    Address dataAddr = ref.getToAddress();
+                    ghidra.program.model.listing.Data data = program.getListing().getDataAt(dataAddr);
+                    if (data != null && data.getValue() instanceof String) {
+                        String strValue = (String) data.getValue();
+                        if (!strValue.isEmpty() && strings.size() < 30) {
+                            Map<String, Object> strInfo = new HashMap<>();
+                            strInfo.put("address", AddressUtil.formatAddress(dataAddr));
+                            strInfo.put("value", strValue.length() > 200 ? strValue.substring(0, 200) + "..." : strValue);
+                            strings.add(strInfo);
+                        }
+                    }
+                }
+            }
+            resultData.put("referencedStrings", strings);
 
             return createJsonResult(resultData);
         });
@@ -998,6 +1425,16 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             "description", "Whether to override the maximum function limit for decompiler searches. Use with caution as large programs may take a long time to search.",
             "default", false
         ));
+        properties.put("startFunctionIndex", Map.of(
+            "type", "integer",
+            "description", "Function index to start searching from (0-based). Use with maxFunctionsToProcess for paginated searching. The response includes nextFunctionIndex to continue from.",
+            "default", 0
+        ));
+        properties.put("maxFunctionsToProcess", Map.of(
+            "type", "integer",
+            "description", "Maximum number of functions to decompile and search in this call. Lower values return faster. Default 0 means no limit (searches all functions). Recommended: 200-500 for interactive use.",
+            "default", 0
+        ));
 
         List<String> required = List.of("programPath", "pattern");
 
@@ -1005,7 +1442,14 @@ public class DecompilerToolProvider extends AbstractToolProvider {
         McpSchema.Tool tool = McpSchema.Tool.builder()
             .name("search-decompilation")
             .title("Search Function Decompilations")
-            .description("Search for patterns across all function decompilations in a program. Returns function names and line numbers where patterns match. If looking for calls or references to data, try the cross reference tools first.")
+            .description("SLOW: Decompiles functions to search them. For large programs, automatically paginates in batches. " +
+                "BEFORE using this tool, try these faster alternatives:\n" +
+                "- search-listing: search disassembly text instantly (instruction patterns, CALL targets, operands)\n" +
+                "- get-symbols(namePattern=...): find functions/data by name regex\n" +
+                "- get-strings(regexPattern=...): find string literals\n" +
+                "- find-cross-references: find calls to/from a known address\n" +
+                "Only use search-decompilation for patterns that exist exclusively in decompiled C code " +
+                "(variable names, type casts, high-level control flow constructs).")
             .inputSchema(createSchema(properties, required))
             .build();
 
@@ -1017,32 +1461,58 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             int maxResults = getOptionalInt(request, "maxResults", 50);
             boolean caseSensitive = getOptionalBoolean(request, "caseSensitive", false);
             boolean overrideMaxFunctionsLimit = getOptionalBoolean(request, "overrideMaxFunctionsLimit", false);
+            int startFunctionIndex = getOptionalInt(request, "startFunctionIndex", 0);
+            int maxFunctionsToProcess = getOptionalInt(request, "maxFunctionsToProcess", 0);
 
             // Validate pattern
             if (pattern.trim().isEmpty()) {
                 return createErrorResult("Search pattern cannot be empty");
             }
 
-            // Get the config manager
+            // Auto-paginate large programs instead of erroring
             ConfigManager config = RevaInternalServiceRegistry.getService(ConfigManager.class);
             int maxFunctions = config.getMaxDecompilerSearchFunctions();
-            if (program.getFunctionManager().getFunctionCount() > maxFunctions && !overrideMaxFunctionsLimit) {
-                return createErrorResult("Program has " + program.getFunctionManager().getFunctionCount() +
-                    " functions, which exceeds the maximum limit of " + maxFunctions +
-                    ". Use 'overrideMaxFunctionsLimit' to bypass this check, but be aware it may take a long time. If possible, try the cross reference tools.");
+            int totalFunctions = program.getFunctionManager().getFunctionCount();
+            boolean autoPaginated = false;
+            if (maxFunctionsToProcess == 0 && !overrideMaxFunctionsLimit && totalFunctions > maxFunctions) {
+                // Instead of erroring, auto-set a batch size
+                maxFunctionsToProcess = maxFunctions;
+                autoPaginated = true;
+                logInfo("search-decompilation: Auto-paginating large program (" + totalFunctions +
+                    " functions) with batch size " + maxFunctionsToProcess);
             }
 
-            // Perform the search with progress reporting
-            List<Map<String, Object>> searchResults = searchDecompilationInProgram(program, pattern, maxResults, caseSensitive, exchange);
+            // Perform the search with progress reporting and pagination
+            SearchDecompilationResult searchResult = searchDecompilationInProgram(
+                program, pattern, maxResults, caseSensitive, exchange,
+                startFunctionIndex, maxFunctionsToProcess);
 
             // Create result data
             Map<String, Object> resultData = new HashMap<>();
             resultData.put("programName", program.getName());
             resultData.put("pattern", pattern);
             resultData.put("caseSensitive", caseSensitive);
-            resultData.put("resultsCount", searchResults.size());
+            resultData.put("resultsCount", searchResult.results.size());
             resultData.put("maxResults", maxResults);
-            resultData.put("results", searchResults);
+            resultData.put("results", searchResult.results);
+
+            // Pagination metadata
+            resultData.put("functionsProcessed", searchResult.functionsProcessed);
+            resultData.put("totalFunctions", totalFunctions);
+            resultData.put("startFunctionIndex", startFunctionIndex);
+            if (searchResult.hasMore) {
+                resultData.put("hasMore", true);
+                resultData.put("nextFunctionIndex", searchResult.nextFunctionIndex);
+            } else {
+                resultData.put("hasMore", false);
+            }
+            if (autoPaginated) {
+                resultData.put("autoPaginated", true);
+                resultData.put("note", "Program has " + totalFunctions + " functions. " +
+                    "Auto-paginated with batch size " + maxFunctions + ". " +
+                    "Use nextFunctionIndex to continue searching, or use " +
+                    "search-listing/get-symbols/find-cross-references for faster alternatives.");
+            }
 
             return createJsonResult(resultData);
         });
@@ -1156,6 +1626,8 @@ public class DecompilerToolProvider extends AbstractToolProvider {
                     }, toolName);
 
                     program.endTransaction(transactionId, true);
+                    // Invalidate cache — variable names changed
+                    invalidateCacheEntry(program, function);
                 } catch (Exception e) {
                     program.endTransaction(transactionId, false);
                     logError(toolName + ": Error during variable renaming", e);
@@ -1298,6 +1770,9 @@ public class DecompilerToolProvider extends AbstractToolProvider {
                     return createErrorResult("Failed to change variable data types: " + e.getMessage());
                 } finally {
                     program.endTransaction(transactionId, transactionSuccess);
+                    if (transactionSuccess) {
+                        invalidateCacheEntry(program, function);
+                    }
                 }
             } finally {
                 decompiler.dispose();
@@ -1346,8 +1821,8 @@ public class DecompilerToolProvider extends AbstractToolProvider {
         Map<String, Object> result = new HashMap<>();
 
         try {
-            // Convert markup to lines
-            List<ClangLine> clangLines = DecompilerUtils.toLines(markup);
+            // Convert markup to lines (null when serving from cache without markup)
+            List<ClangLine> clangLines = markup != null ? DecompilerUtils.toLines(markup) : null;
             String[] decompLines = fullDecompCode.split("\n");
 
             // Calculate range
@@ -1540,19 +2015,46 @@ public class DecompilerToolProvider extends AbstractToolProvider {
     }
 
     /**
-     * Search decompilation across all functions in a program
+     * Result of a paginated decompilation search.
+     */
+    private static class SearchDecompilationResult {
+        final List<Map<String, Object>> results;
+        final int functionsProcessed;
+        final int nextFunctionIndex;
+        final boolean hasMore;
+
+        SearchDecompilationResult(List<Map<String, Object>> results, int functionsProcessed,
+                int nextFunctionIndex, boolean hasMore) {
+            this.results = results;
+            this.functionsProcessed = functionsProcessed;
+            this.nextFunctionIndex = nextFunctionIndex;
+            this.hasMore = hasMore;
+        }
+    }
+
+    /**
+     * Search decompilation across functions in a program with pagination support.
      * @param program The program to search
      * @param pattern Regular expression pattern
-     * @param maxResults Maximum number of results
+     * @param maxResults Maximum number of results to return
      * @param caseSensitive Whether search is case sensitive
-     * @return List of search results
+     * @param exchange MCP exchange for progress notifications
+     * @param startFunctionIndex Function index to start from (0-based)
+     * @param maxFunctionsToProcess Max functions to decompile (0 = unlimited)
+     * @return SearchDecompilationResult with results and pagination state
      */
-    private List<Map<String, Object>> searchDecompilationInProgram(Program program, String pattern,
-            int maxResults, boolean caseSensitive, io.modelcontextprotocol.server.McpSyncServerExchange exchange) {
+    private SearchDecompilationResult searchDecompilationInProgram(Program program, String pattern,
+            int maxResults, boolean caseSensitive, io.modelcontextprotocol.server.McpSyncServerExchange exchange,
+            int startFunctionIndex, int maxFunctionsToProcess) {
         List<Map<String, Object>> results = new ArrayList<>();
         final String toolName = "search-decompilation";
+        int functionsProcessed = 0;
+        int currentIndex = 0;
+        boolean hasMore = false;
+        int nextFunctionIndex = 0;
 
-        logInfo(toolName + ": Starting search in " + program.getName() + " for pattern: " + pattern);
+        logInfo(toolName + ": Starting search in " + program.getName() + " for pattern: " + pattern +
+            " (startIndex=" + startFunctionIndex + ", maxFunctions=" + maxFunctionsToProcess + ")");
 
         try {
             // Compile the regex pattern
@@ -1562,13 +2064,12 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             // Initialize decompiler using helper
             DecompInterface decompiler = createConfiguredDecompiler(program, toolName);
             if (decompiler == null) {
-                return results; // Failed to initialize decompiler
+                return new SearchDecompilationResult(results, 0, 0, false);
             }
 
             try {
                 // Count total functions for progress tracking
                 int totalFunctions = program.getFunctionManager().getFunctionCount();
-                int processedFunctions = 0;
 
                 // Generate unique progress token for this search
                 String progressToken = "search-" + System.currentTimeMillis();
@@ -1581,9 +2082,24 @@ public class DecompilerToolProvider extends AbstractToolProvider {
 
                 // Iterate through all functions
                 FunctionIterator functions = program.getFunctionManager().getFunctions(true);
+
+                // Skip to startFunctionIndex
+                while (functions.hasNext() && currentIndex < startFunctionIndex) {
+                    functions.next();
+                    currentIndex++;
+                }
+
                 while (functions.hasNext() && results.size() < maxResults) {
+                    // Check pagination limit
+                    if (maxFunctionsToProcess > 0 && functionsProcessed >= maxFunctionsToProcess) {
+                        hasMore = true;
+                        nextFunctionIndex = currentIndex;
+                        break;
+                    }
+
                     Function function = functions.next();
-                    processedFunctions++;
+                    currentIndex++;
+                    functionsProcessed++;
 
                     // Skip external functions
                     if (function.isExternal()) {
@@ -1591,30 +2107,51 @@ public class DecompilerToolProvider extends AbstractToolProvider {
                     }
 
                     try {
-                        // Use inline decompilation here instead of decompileFunctionSafely because:
-                        // 1. We want to continue to the next function on timeout (not return an error)
-                        // 2. We don't need the DecompilationAttempt wrapper for this use case
-                        TaskMonitor functionTimeoutMonitor = createTimeoutMonitor();
-                        DecompileResults decompileResults = decompiler.decompileFunction(function, 0, functionTimeoutMonitor);
-                        if (isTimedOut(functionTimeoutMonitor)) {
-                            Msg.warn(DecompilerToolProvider.class, toolName + ": Decompilation timed out for function " +
-                                function.getName() + " after " + getTimeoutSeconds() + " seconds");
-                            continue; // Skip this function and continue with the next one
-                        }
+                        // Check cache first
+                        String cacheKey = makeCacheKey(program, function.getEntryPoint());
+                        CachedDecompilation cached = cacheGet(program, cacheKey);
 
-                        if (decompileResults.decompileCompleted()) {
-                            // Search the decompiled code for matches
-                            searchDecompiledCode(function, decompileResults, regex, results, maxResults);
+                        if (cached != null) {
+                            // Search cached C text directly — no decompilation needed
+                            searchCachedCode(function, cached.cCode, regex, results, maxResults);
+                        } else {
+                            // Skip blacklisted (timed-out) functions
+                            Long blacklistTime = timeoutBlacklist.get(cacheKey);
+                            if (blacklistTime != null && (System.currentTimeMillis() - blacklistTime) < TIMEOUT_BLACKLIST_EXPIRY_MS) {
+                                continue;
+                            }
+
+                            TaskMonitor functionTimeoutMonitor = createTimeoutMonitor();
+                            DecompileResults decompileResults = decompiler.decompileFunction(function, 0, functionTimeoutMonitor);
+                            if (isTimedOut(functionTimeoutMonitor)) {
+                                Msg.warn(DecompilerToolProvider.class, toolName + ": Decompilation timed out for function " +
+                                    function.getName() + " after " + getTimeoutSeconds() + " seconds");
+                                timeoutBlacklist.put(cacheKey, System.currentTimeMillis());
+                                continue;
+                            }
+
+                            if (decompileResults.decompileCompleted()) {
+                                String cCode = decompileResults.getDecompiledFunction().getC();
+                                String signature = decompileResults.getDecompiledFunction().getSignature();
+                                cachePut(program, cacheKey, new CachedDecompilation(cCode, signature));
+                                searchDecompiledCode(function, decompileResults, regex, results, maxResults);
+                            }
                         }
                     } catch (Exception e) {
-                        // Skip this function if decompilation fails
                         logError(toolName + ": Failed to decompile function: " + function.getName(), e);
                         continue;
                     }
 
                     // Send progress update every 10 functions or when search is complete
-                    sendSearchProgress(exchange, progressToken, processedFunctions, totalFunctions,
+                    sendSearchProgress(exchange, progressToken,
+                        startFunctionIndex + functionsProcessed, totalFunctions,
                         results.size(), maxResults, functions.hasNext());
+                }
+
+                // If we stopped because of maxResults but there are more functions
+                if (!hasMore && functions.hasNext() && results.size() >= maxResults) {
+                    hasMore = true;
+                    nextFunctionIndex = currentIndex;
                 }
             } finally {
                 decompiler.dispose();
@@ -1626,7 +2163,7 @@ public class DecompilerToolProvider extends AbstractToolProvider {
             logError(toolName + ": Error during decompilation search", e);
         }
 
-        return results;
+        return new SearchDecompilationResult(results, functionsProcessed, nextFunctionIndex, hasMore);
     }
 
     /**
@@ -1638,6 +2175,31 @@ public class DecompilerToolProvider extends AbstractToolProvider {
         String decompCode = decompiledFunction.getC();
 
         // Search each line
+        String[] lines = decompCode.split("\n");
+        for (int i = 0; i < lines.length && results.size() < maxResults; i++) {
+            String line = lines[i];
+            Matcher matcher = regex.matcher(line);
+
+            if (matcher.find()) {
+                Map<String, Object> result = new HashMap<>();
+                result.put("functionName", function.getName());
+                result.put("functionAddress", AddressUtil.formatAddress(function.getEntryPoint()));
+                result.put("lineNumber", i + 1);
+                result.put("lineContent", line.trim());
+                result.put("matchStart", matcher.start());
+                result.put("matchEnd", matcher.end());
+                result.put("matchedText", matcher.group());
+
+                results.add(result);
+            }
+        }
+    }
+
+    /**
+     * Searches cached decompiled C text for regex matches (no DecompileResults needed).
+     */
+    private void searchCachedCode(Function function, String decompCode,
+            Pattern regex, List<Map<String, Object>> results, int maxResults) {
         String[] lines = decompCode.split("\n");
         for (int i = 0; i < lines.length && results.size() < maxResults; i++) {
             String line = lines[i];
@@ -1939,6 +2501,8 @@ public class DecompilerToolProvider extends AbstractToolProvider {
                     }
 
                     program.endTransaction(transactionId, true);
+                    // Comments change decompilation output
+                    invalidateCacheEntry(program, function);
 
                     logInfo(toolName + ": Successfully set comment at " + targetAddress +
                         " (requested line " + lineNumber + ", matched " + match.matchedDisplayLineNumber() + ")");

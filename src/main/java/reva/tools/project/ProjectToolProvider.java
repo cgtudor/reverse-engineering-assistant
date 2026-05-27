@@ -242,7 +242,8 @@ public class ProjectToolProvider extends AbstractToolProvider {
         McpSchema.Tool tool = McpSchema.Tool.builder()
             .name("list-open-programs")
             .title("List Open Programs")
-            .description("List all programs currently open in Ghidra across all tools")
+            .description("List all programs currently open in Ghidra, plus all available programs in the project that can be opened on demand. " +
+                "Use the programPath from this list when calling other tools.")
             .inputSchema(createSchema(properties, required))
             .build();
 
@@ -251,15 +252,14 @@ public class ProjectToolProvider extends AbstractToolProvider {
             // Get all open programs from all tools
             List<Program> openPrograms = RevaProgramManager.getOpenPrograms();
 
-            if (openPrograms.isEmpty()) {
-                return createErrorResult("No programs are currently open in Ghidra");
-            }
-
-            // Create program info for each program
+            // Create program info for each open program
             List<Map<String, Object>> programsData = new ArrayList<>();
+            java.util.Set<String> openPaths = new java.util.HashSet<>();
             for (Program program : openPrograms) {
                 Map<String, Object> programInfo = new HashMap<>();
-                programInfo.put("programPath", program.getDomainFile().getPathname());
+                String path = program.getDomainFile().getPathname();
+                programInfo.put("programPath", path);
+                programInfo.put("status", "open");
                 programInfo.put("language", program.getLanguage().getLanguageID().getIdAsString());
                 programInfo.put("compilerSpec", program.getCompilerSpec().getCompilerSpecID().getIdAsString());
                 programInfo.put("creationDate", program.getCreationDate());
@@ -269,10 +269,28 @@ public class ProjectToolProvider extends AbstractToolProvider {
                 programInfo.put("modificationDate", program.getDomainFile().getLastModifiedTime());
                 programInfo.put("isReadOnly", program.getDomainFile().isReadOnly());
                 programsData.add(programInfo);
+                openPaths.add(path);
+            }
+
+            // Also list available (not yet opened) programs from the project
+            Project project = AppInfo.getActiveProject();
+            if (project != null) {
+                try {
+                    DomainFolder rootFolder = project.getProjectData().getRootFolder();
+                    collectAvailablePrograms(rootFolder, programsData, openPaths);
+                } catch (Exception e) {
+                    logError("Error listing project programs", e);
+                }
+            }
+
+            if (programsData.isEmpty()) {
+                return createErrorResult("No programs are currently open or available in the project");
             }
 
             Map<String, Object> result = new HashMap<>();
             result.put("count", programsData.size());
+            result.put("openCount", openPaths.size());
+            result.put("availableCount", programsData.size() - openPaths.size());
             result.put("programs", programsData);
             return createJsonResult(result);
         });
@@ -442,6 +460,31 @@ public class ProjectToolProvider extends AbstractToolProvider {
         // Recursively collect from subfolders
         for (DomainFolder subfolder : folder.getFolders()) {
             collectAllProgramPaths(subfolder, programPaths);
+        }
+    }
+
+    /**
+     * Collect available (not yet opened) programs from the project.
+     * Adds them to the list with status "available" so the agent knows they can be used.
+     */
+    private void collectAvailablePrograms(DomainFolder folder, List<Map<String, Object>> programsData,
+            java.util.Set<String> openPaths) {
+        for (DomainFile file : folder.getFiles()) {
+            if ("Program".equals(file.getContentType())) {
+                String path = file.getPathname();
+                if (!openPaths.contains(path)) {
+                    Map<String, Object> programInfo = new HashMap<>();
+                    programInfo.put("programPath", path);
+                    programInfo.put("status", "available");
+                    programInfo.put("contentType", file.getContentType());
+                    programInfo.put("modificationDate", file.getLastModifiedTime());
+                    programInfo.put("isReadOnly", file.isReadOnly());
+                    programsData.add(programInfo);
+                }
+            }
+        }
+        for (DomainFolder subfolder : folder.getFolders()) {
+            collectAvailablePrograms(subfolder, programsData, openPaths);
         }
     }
 

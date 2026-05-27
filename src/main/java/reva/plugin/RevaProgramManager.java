@@ -322,10 +322,33 @@ public class RevaProgramManager {
             return null;
         }
 
-        // Open the program
-        ProgramOpener programOpener = new ProgramOpener(programCache);
-        ProgramLocator locator = new ProgramLocator(domainFile);
-        Program program = programOpener.openProgram(locator, TaskMonitor.DUMMY);
+        // Open the program — try GUI ProgramOpener first, fall back to
+        // direct DomainFile open for headless mode where no PluginTool exists.
+        Program program = null;
+        try {
+            ProgramOpener programOpener = new ProgramOpener(programCache);
+            ProgramLocator locator = new ProgramLocator(domainFile);
+            program = programOpener.openProgram(locator, TaskMonitor.DUMMY);
+        } catch (Exception e) {
+            Msg.debug(RevaProgramManager.class,
+                "ProgramOpener failed (headless mode?), falling back to direct open: " + e.getMessage());
+        }
+
+        // Headless fallback: open directly from the DomainFile
+        if (program == null) {
+            try {
+                Msg.debug(RevaProgramManager.class,
+                    "Opening program directly from DomainFile: " + domainFile.getPathname());
+                Object domainObject = domainFile.getDomainObject(
+                    programCache, true, false, TaskMonitor.DUMMY);
+                if (domainObject instanceof Program) {
+                    program = (Program) domainObject;
+                }
+            } catch (Exception e) {
+                Msg.error(RevaProgramManager.class,
+                    "Failed to open program from DomainFile: " + programPath, e);
+            }
+        }
 
         if (program != null) {
             // Ensure the program is checked out if versioned

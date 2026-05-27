@@ -154,7 +154,7 @@ src/main/java/reva/          # Java extension code
   ├── util/                  # Foundational utilities (ALWAYS use these!)
   ├── plugin/                # ConfigManager, plugin lifecycle
   ├── server/                # McpServerManager, Jetty
-  ├── tools/                 # 18 tool provider packages
+  ├── tools/                 # 19 tool provider packages
   ├── resources/             # MCP resource providers
   ├── headless/              # RevaHeadlessLauncher
   └── ui/                    # Optional GUI components

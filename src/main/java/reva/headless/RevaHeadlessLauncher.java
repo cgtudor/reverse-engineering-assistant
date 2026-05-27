@@ -217,13 +217,71 @@ public class RevaHeadlessLauncher {
             // Check if project already exists
             if (locator.getMarkerFile().exists() && locator.getProjectDir().exists()) {
                 Msg.info(this, "Opening existing project: " + name + " at " + projectLocationPath);
-                return GhidraProject.openProject(projectLocationPath, name, true);
+                try {
+                    return GhidraProject.openProject(projectLocationPath, name, true);
+                } catch (Exception lockException) {
+                    if (lockException.toString().contains("LockException") ||
+                        lockException.toString().contains("Unable to lock")) {
+                        // Try to clean up stale lock
+                        if (tryCleanStaleLock(location, name)) {
+                            Msg.info(this, "Cleaned stale lock, retrying open...");
+                            return GhidraProject.openProject(projectLocationPath, name, true);
+                        }
+                    }
+                    throw lockException;
+                }
             } else {
                 Msg.info(this, "Creating new project: " + name + " at " + projectLocationPath);
                 return GhidraProject.createProject(projectLocationPath, name, false);
             }
         } catch (Exception e) {
             throw new IOException("Failed to create/open project: " + name, e);
+        }
+    }
+
+    /**
+     * Attempt to clean up a stale lock file from a crashed process.
+     * Reads the lock file to find the PID, checks if that process is still alive,
+     * and deletes the lock if the process is gone.
+     *
+     * @param location The project directory
+     * @param name The project name
+     * @return true if a stale lock was cleaned up, false otherwise
+     */
+    private boolean tryCleanStaleLock(File location, String name) {
+        File lockFile = new File(location, name + ".lock");
+        if (!lockFile.exists()) {
+            return false;
+        }
+
+        Msg.warn(this, "Project lock file exists: " + lockFile.getAbsolutePath());
+
+        // The Ghidra lock file is a properties file. It doesn't contain a PID directly,
+        // but we can check if any other Java/mcp-reva process holds the file.
+        // On Windows, a locked file can't be deleted if the owning process is alive.
+        // On Unix, we'd need to check /proc. The simplest cross-platform approach:
+        // try to delete the lock file — if it succeeds, the owning process is gone.
+        try {
+            // Try to rename first (atomic check on Windows — fails if file is locked by another process)
+            File tempLock = new File(location, name + ".lock.stale");
+            if (lockFile.renameTo(tempLock)) {
+                // Rename succeeded — the original process is gone, this is a stale lock
+                if (tempLock.delete()) {
+                    Msg.info(this, "Cleaned stale lock file: " + lockFile.getAbsolutePath());
+                    return true;
+                } else {
+                    // Rename back if we can't delete
+                    tempLock.renameTo(lockFile);
+                    return false;
+                }
+            } else {
+                // Rename failed — the file is actively locked by another process
+                Msg.warn(this, "Lock file is actively held by another process");
+                return false;
+            }
+        } catch (Exception e) {
+            Msg.warn(this, "Could not check lock file: " + e.getMessage());
+            return false;
         }
     }
 

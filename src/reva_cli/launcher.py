@@ -16,16 +16,24 @@ class ReVaLauncher:
     Projects are created per-session and cleaned up on exit.
     """
 
-    def __init__(self, config_file: Optional[Path] = None, use_random_port: bool = True):
+    def __init__(self, config_file: Optional[Path] = None, use_random_port: bool = True,
+                 project_path: Optional[Path] = None, project_name: Optional[str] = None,
+                 fixed_port: Optional[int] = None):
         """
         Initialize ReVa launcher.
 
         Args:
             config_file: Optional configuration file path
             use_random_port: Whether to use random available port (default: True)
+            project_path: Optional path to existing Ghidra project directory (persistent mode)
+            project_name: Optional Ghidra project name (required with project_path)
+            fixed_port: Optional fixed port number (used with use_random_port=False)
         """
         self.config_file = config_file
         self.use_random_port = use_random_port
+        self.project_path = project_path
+        self.project_name = project_name
+        self.fixed_port = fixed_port
         self.java_launcher = None
         self.port = None
         self.temp_project_dir = None
@@ -47,40 +55,44 @@ class ReVaLauncher:
             from .project_manager import ProjectManager
             import tempfile
 
-            # Stdio mode: ephemeral projects in temp directory (session-scoped, auto-cleanup)
-            # Keeps working directory clean - no .reva creation in cwd
-            self.temp_project_dir = Path(tempfile.mkdtemp(prefix="reva_project_"))
-            project_manager = ProjectManager()
-            project_name = project_manager.get_project_name()
-
-            # Use temp directory for the project (not .reva/projects)
-            projects_dir = self.temp_project_dir
+            # Determine project location and name
+            if self.project_path and self.project_name:
+                # Persistent mode: use existing project
+                projects_dir = self.project_path
+                project_name = self.project_name
+                print(f"Opening existing project: {projects_dir}/{project_name}", file=sys.stderr)
+            else:
+                # Ephemeral mode: temp directory (session-scoped, auto-cleanup)
+                self.temp_project_dir = Path(tempfile.mkdtemp(prefix="reva_project_"))
+                project_manager = ProjectManager()
+                project_name = project_manager.get_project_name()
+                projects_dir = self.temp_project_dir
+                print(f"Project location: {projects_dir}/{project_name}", file=sys.stderr)
 
             # Convert to Java File objects
             java_project_location = File(str(projects_dir))
 
-            print(f"Project location: {projects_dir}/{project_name}", file=sys.stderr)
-
-            # Create launcher with project parameters
+            # Resolve config file — generate one for fixed port if needed
+            java_config_file = None
             if self.config_file:
                 print(f"Using config file: {self.config_file}", file=sys.stderr)
                 java_config_file = File(str(self.config_file))
-                self.java_launcher = RevaHeadlessLauncher(
-                    java_config_file,
-                    self.use_random_port,
-                    java_project_location,
-                    project_name
-                )
-            else:
-                print("Using default configuration", file=sys.stderr)
-                # Use constructor with project parameters
-                self.java_launcher = RevaHeadlessLauncher(
-                    None,
-                    True,  # autoInitializeGhidra
-                    self.use_random_port,
-                    java_project_location,
-                    project_name
-                )
+            elif self.fixed_port is not None and not self.use_random_port:
+                # Write a temp config with the requested port
+                self._port_config = Path(tempfile.mkdtemp(prefix="reva_cfg_")) / "reva.properties"
+                self._port_config.write_text(
+                    f"reva.server.options.server.port={self.fixed_port}\n")
+                java_config_file = File(str(self._port_config))
+                print(f"Using fixed port {self.fixed_port}", file=sys.stderr)
+
+            # Create launcher
+            self.java_launcher = RevaHeadlessLauncher(
+                java_config_file,
+                True,  # autoInitializeGhidra
+                self.use_random_port,
+                java_project_location,
+                project_name
+            )
 
             # Start server
             print("Starting ReVa MCP server...", file=sys.stderr)

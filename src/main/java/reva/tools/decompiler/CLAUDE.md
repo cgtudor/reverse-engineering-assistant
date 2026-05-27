@@ -10,7 +10,7 @@ The `reva.tools.decompiler` package provides MCP tools for function decompilatio
 
 ### Core Decompilation Tools
 - `get-decompilation` - Get decompiled function with line range support, optional assembly sync, comments, incoming references, and caller/callee lists
-- `search-decompilation` - Search regex patterns across all function decompilations
+- `search-decompilation` - Search regex patterns across function decompilations (supports pagination via `startFunctionIndex`/`maxFunctionsToProcess`)
 - `rename-variables` - Rename variables in decompiled functions (with diff)
 - `change-variable-datatypes` - Change variable data types (with diff)
 - `set-decompilation-comment` - Set comment at specific decompilation line
@@ -514,6 +514,21 @@ if (isTimedOut(functionTimeoutMonitor)) {
     continue; // Skip this function and continue with next
 }
 ```
+
+### Search Decompilation Pagination
+The `search-decompilation` tool supports pagination for large programs:
+- `startFunctionIndex` (int, default 0) — Skip to this function index
+- `maxFunctionsToProcess` (int, default 0=unlimited) — Process at most N functions per call
+
+Response includes pagination state:
+- `functionsProcessed` — How many functions were decompiled in this call
+- `totalFunctions` — Total function count in the program
+- `hasMore` (boolean) — Whether more functions remain
+- `nextFunctionIndex` — Pass as `startFunctionIndex` to continue
+
+When `maxFunctionsToProcess > 0`, the max-functions-limit config check is bypassed (pagination implies the user is managing batch size). Recommended: 200-500 for interactive use.
+
+**Consider `search-listing` first** — it searches disassembly text without decompilation and is orders of magnitude faster for instruction-level patterns.
 
 ### Progress Notifications in Search
 ```java

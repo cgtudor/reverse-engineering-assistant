@@ -17,9 +17,12 @@ package reva.tools.symbols;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.Symbol;
@@ -70,6 +73,10 @@ public class SymbolToolProvider extends AbstractToolProvider {
             "description", "Whether to filter out default Ghidra generated names like FUN_, DAT_, etc.",
             "default", true
         ));
+        properties.put("namePattern", Map.of(
+            "type", "string",
+            "description", "Optional regex pattern to filter symbols by name (e.g. '(?i)parse.*string' to find symbols with 'parse' and 'string' in their name)"
+        ));
 
         List<String> required = List.of("programPath");
 
@@ -77,7 +84,7 @@ public class SymbolToolProvider extends AbstractToolProvider {
         McpSchema.Tool tool = McpSchema.Tool.builder()
             .name("get-symbols-count")
             .title("Get Symbols Count")
-            .description("Get the total count of symbols in the program (use this before calling get-symbols to plan pagination)")
+            .description("Get the total count of symbols in the program (use this before calling get-symbols to plan pagination). Optionally filter by name pattern.")
             .inputSchema(createSchema(properties, required))
             .build();
 
@@ -87,28 +94,51 @@ public class SymbolToolProvider extends AbstractToolProvider {
             Program program = getProgramFromArgs(request);
             boolean includeExternal = getOptionalBoolean(request, "includeExternal", false);
             boolean filterDefaultNames = getOptionalBoolean(request, "filterDefaultNames", true);
+            String namePatternStr = getOptionalString(request, "namePattern", null);
+
+            // Compile name pattern if provided
+            Pattern nameRegex = null;
+            if (namePatternStr != null && !namePatternStr.trim().isEmpty()) {
+                try {
+                    nameRegex = Pattern.compile(namePatternStr);
+                } catch (PatternSyntaxException e) {
+                    return createErrorResult("Invalid regex pattern: " + e.getMessage());
+                }
+            }
 
             // Count the symbols
             SymbolTable symbolTable = program.getSymbolTable();
             SymbolIterator symbolIterator = symbolTable.getAllSymbols(true);
 
-            AtomicInteger count = new AtomicInteger(0);
-            symbolIterator.forEach(symbol -> {
+            int count = 0;
+            while (symbolIterator.hasNext()) {
+                Symbol symbol = symbolIterator.next();
+
                 // Skip external symbols if not included
                 if (!includeExternal && symbol.isExternal()) {
-                    return;
+                    continue;
                 }
 
-                if (!filterDefaultNames || !SymbolUtil.isDefaultSymbolName(symbol.getName())) {
-                    count.incrementAndGet();
+                if (filterDefaultNames && SymbolUtil.isDefaultSymbolName(symbol.getName())) {
+                    continue;
                 }
-            });
+
+                // Apply name pattern filter
+                if (nameRegex != null && !nameRegex.matcher(symbol.getName()).find()) {
+                    continue;
+                }
+
+                count++;
+            }
 
             // Create result data
             Map<String, Object> countData = new HashMap<>();
-            countData.put("count", count.get());
+            countData.put("count", count);
             countData.put("includeExternal", includeExternal);
             countData.put("filterDefaultNames", filterDefaultNames);
+            if (namePatternStr != null) {
+                countData.put("namePattern", namePatternStr);
+            }
 
             return createJsonResult(countData);
         });
@@ -144,6 +174,15 @@ public class SymbolToolProvider extends AbstractToolProvider {
             "description", "Whether to filter out default Ghidra generated names like FUN_, DAT_, etc.",
             "default", true
         ));
+        properties.put("namePattern", Map.of(
+            "type", "string",
+            "description", "Optional regex pattern to filter symbols by name (e.g. '(?i)parse.*string' to find symbols with 'parse' and 'string' in their name)"
+        ));
+        properties.put("symbolTypes", Map.of(
+            "type", "array",
+            "description", "Optional list of symbol types to include (e.g. ['Function', 'Label', 'Class']). If not specified, all types are included.",
+            "items", Map.of("type", "string")
+        ));
 
         List<String> required = List.of("programPath");
 
@@ -151,7 +190,7 @@ public class SymbolToolProvider extends AbstractToolProvider {
         McpSchema.Tool tool = McpSchema.Tool.builder()
             .name("get-symbols")
             .title("Get Symbols")
-            .description("Get symbols from the selected program with pagination (use get-symbols-count first to determine total count)")
+            .description("Get symbols from the selected program with pagination and optional filtering. Use namePattern to search for symbols by regex. Much faster than search-decompilation for finding functions or data by name.")
             .inputSchema(createSchema(properties, required))
             .build();
 
@@ -162,6 +201,27 @@ public class SymbolToolProvider extends AbstractToolProvider {
             boolean includeExternal = getOptionalBoolean(request, "includeExternal", false);
             PaginationParams pagination = getPaginationParams(request, 200);
             boolean filterDefaultNames = getOptionalBoolean(request, "filterDefaultNames", true);
+            String namePatternStr = getOptionalString(request, "namePattern", null);
+            List<String> symbolTypeFilter = getOptionalStringList(request.arguments(), "symbolTypes", null);
+
+            // Compile name pattern if provided
+            Pattern nameRegex = null;
+            if (namePatternStr != null && !namePatternStr.trim().isEmpty()) {
+                try {
+                    nameRegex = Pattern.compile(namePatternStr);
+                } catch (PatternSyntaxException e) {
+                    return createErrorResult("Invalid regex pattern: " + e.getMessage());
+                }
+            }
+
+            // Build symbol type filter set
+            Set<String> typeFilter = null;
+            if (symbolTypeFilter != null && !symbolTypeFilter.isEmpty()) {
+                typeFilter = new HashSet<>();
+                for (String t : symbolTypeFilter) {
+                    typeFilter.add(t.toUpperCase());
+                }
+            }
 
             // Get the symbols with pagination
             List<Map<String, Object>> symbolData = new ArrayList<>();
@@ -180,6 +240,16 @@ public class SymbolToolProvider extends AbstractToolProvider {
 
                 // Skip default names if filtering is enabled
                 if (filterDefaultNames && SymbolUtil.isDefaultSymbolName(symbol.getName())) {
+                    continue;
+                }
+
+                // Apply name pattern filter
+                if (nameRegex != null && !nameRegex.matcher(symbol.getName()).find()) {
+                    continue;
+                }
+
+                // Apply symbol type filter
+                if (typeFilter != null && !typeFilter.contains(symbol.getSymbolType().toString().toUpperCase())) {
                     continue;
                 }
 
@@ -208,6 +278,9 @@ public class SymbolToolProvider extends AbstractToolProvider {
             paginationInfo.put("totalProcessed", currentIndex);
             paginationInfo.put("includeExternal", includeExternal);
             paginationInfo.put("filterDefaultNames", filterDefaultNames);
+            if (namePatternStr != null) {
+                paginationInfo.put("namePattern", namePatternStr);
+            }
 
             paginationInfo.put("symbols", symbolData);
             return createJsonResult(paginationInfo);
